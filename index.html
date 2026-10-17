@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My LMS — Drive Upload</title>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+:root{font-family:Arial,sans-serif;color:#1d3552;background:#f4f7fb}*{box-sizing:border-box}body{margin:0;padding:24px}.wrap{max-width:640px;margin:20px auto;background:white;padding:28px;border-radius:12px;box-shadow:0 4px 22px #1a355015}h1{margin-top:0}label{display:block;margin:18px 0 6px;font-weight:600}input,select,button{font:inherit}input,select{width:100%;padding:11px;border:1px solid #b6c5d5;border-radius:7px}button{border:0;border-radius:7px;padding:11px 17px;background:#173e70;color:white;cursor:pointer}button:disabled{opacity:.55;cursor:not-allowed}.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}.muted{color:#64748b;font-size:13px}#status{white-space:pre-wrap;overflow-wrap:anywhere}progress{width:100%;height:18px}a{overflow-wrap:anywhere}#result{margin-top:12px}code{background:#eef2f6;padding:2px 5px}
+</style>
+</head>
+<body><main class="wrap">
+<h1>My LMS — File Upload</h1>
+<p class="muted">Google Drive resumable upload · PDF / DOCX / PPTX · สูงสุด 50 MB</p>
+<p class="muted">เจ้าของ LMS เท่านั้นในช่วงทดสอบ ไฟล์จะถูกสร้างใน My Drive ของบัญชีที่อนุญาต</p>
+<label for="clientId">Google OAuth Client ID</label>
+<input id="clientId" placeholder="123...apps.googleusercontent.com" autocomplete="off">
+<label for="file">เลือกไฟล์</label>
+<input id="file" type="file" accept=".pdf,.docx,.pptx">
+<div class="row"><button id="login">Authorize Google Drive</button><button id="upload" disabled>Upload File</button><button id="cancel" disabled>Cancel</button></div>
+<p id="account" class="muted">ยังไม่ได้รับสิทธิ์ Google Drive</p>
+<progress id="progress" value="0" max="100"></progress><p id="percent" class="muted">0%</p>
+<p id="status" role="status"></p><div id="result"></div>
+<hr><p class="muted">หลังทดสอบสำเร็จ เราจะเชื่อมไฟล์กับ CourseResources ใน Apps Script โดยตรวจสอบสิทธิ์ฝั่ง Server ก่อนบันทึก</p>
+</main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const MAX=50*1024*1024, CHUNK=4*1024*1024;
+const MIME={pdf:'application/pdf',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation'};
+let accessToken='', tokenClient=null, controller=null, uploading=false;
+const status=s=>$('status').textContent=s;
+function setBusy(b){uploading=b;$('upload').disabled=b||!accessToken;$('cancel').disabled=!b;$('login').disabled=b;$('file').disabled=b;}
+function errorMessage(e){return e instanceof Error?e.message:String(e);}
+function wait(ms){return new Promise(r=>setTimeout(r,ms));}
+function authorize(){
+ const id=$('clientId').value.trim();
+ if(!/^[\w-]+\.apps\.googleusercontent\.com$/.test(id)){status('กรุณากรอก OAuth Client ID ให้ถูกต้อง');return;}
+ if(!window.google?.accounts?.oauth2){status('Google Identity Services ยังโหลดไม่สำเร็จ กรุณาลองอีกครั้ง');return;}
+ tokenClient=google.accounts.oauth2.initTokenClient({client_id:id,scope:'https://www.googleapis.com/auth/drive.file',callback:response=>{
+   if(response.error){status('OAuth error: '+response.error);return;}
+   accessToken=response.access_token;
+   $('account').textContent='อนุญาต Google Drive แล้ว (สิทธิ์ชั่วคราว)';
+   $('upload').disabled=false;status('พร้อมอัปโหลด');
+ }});
+ tokenClient.requestAccessToken({prompt:'consent'});
+}
+async function apiFetch(url,options={},tries=3){
+ for(let i=0;;i++){
+   try{
+     const r=await fetch(url,options);
+     if((r.status===429||r.status>=500)&&i<tries){await wait(800*Math.pow(2,i));continue;}
+     return r;
+   }catch(e){if(i>=tries||options.signal?.aborted)throw e;await wait(800*Math.pow(2,i));}
+ }
+}
+async function startSession(file,mime){
+ // The browser makes the authenticated session request. The Drive response must expose Location via CORS.
+ const metadata={name:file.name,mimeType:mime};
+ const url='https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,webViewLink,mimeType,size';
+ const r=await apiFetch(url,{method:'POST',headers:{Authorization:'Bearer '+accessToken,'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':mime,'X-Upload-Content-Length':String(file.size)},body:JSON.stringify(metadata),signal:controller.signal});
+ if(!r.ok)throw new Error('Cannot start upload ('+r.status+'): '+(await r.text()).slice(0,300));
+ const session=r.headers.get('Location');
+ if(!session)throw new Error('Drive did not expose resumable session URL (Location header). Browser CORS restriction may prevent this approach.');
+ return session;
+}
+async function queryOffset(session,total){
+ const r=await fetch(session,{method:'PUT',headers:{'Content-Range':'bytes */'+total},signal:controller.signal});
+ if(r.status===308){const range=r.headers.get('Range');return range?Number(range.match(/-(\d+)$/)?.[1]||-1)+1:0;}
+ if(r.ok)return total;
+ throw new Error('Upload status request failed: '+r.status);
+}
+async function sendChunk(session,file,start){
+ const end=Math.min(start+CHUNK,file.size);
+ const part=file.slice(start,end);
+ const r=await fetch(session,{method:'PUT',headers:{'Content-Type':'application/octet-stream','Content-Range':`bytes ${start}-${end-1}/${file.size}`},body:part,signal:controller.signal});
+ if(r.status===308){const range=r.headers.get('Range');return {next:range?Number(range.match(/-(\d+)$/)?.[1]||-1)+1:0};}
+ if(!r.ok)throw new Error('Chunk upload failed ('+r.status+'): '+(await r.text()).slice(0,300));
+ return {next:file.size,result:await r.json()};
+}
+async function upload(){
+ if(!accessToken){status('กรุณา Authorize ก่อน');return;}
+ const file=$('file').files[0];if(!file){status('กรุณาเลือกไฟล์');return;}
+ const ext=file.name.split('.').pop().toLowerCase(),mime=MIME[ext];
+ if(!mime||file.size===0||file.size>MAX){status('รองรับ PDF, DOCX, PPTX ขนาด 1 byte ถึง 50 MB');return;}
+ controller=new AbortController();setBusy(true);$('result').replaceChildren();$('progress').value=0;$('percent').textContent='0%';
+ try{
+  status('กำลังเริ่มการอัปโหลด...');const session=await startSession(file,mime);
+  let offset=0,attempts=0,result;
+  while(offset<file.size){
+   if(controller.signal.aborted)throw new Error('Upload cancelled');
+   try{
+    const response=await sendChunk(session,file,offset);
+    if(response.next<=offset)throw new Error('Upload did not advance');
+    offset=response.next;result=response.result||result;attempts=0;
+   }catch(e){
+    if(controller.signal.aborted)throw e;
+    if(++attempts>3)throw e;
+    status('Connection interrupted. Checking uploaded bytes...');await wait(attempts*1000);
+    offset=await queryOffset(session,file.size);
+   }
+   const pct=Math.round(offset/file.size*100);$('progress').value=pct;$('percent').textContent=pct+'%';
+   status('Uploading '+offset.toLocaleString()+' / '+file.size.toLocaleString()+' bytes');
+  }
+  if(!result?.id)throw new Error('Upload finished, but no file ID was returned. Check Drive before retrying.');
+  const a=document.createElement('a');a.href=result.webViewLink||'https://drive.google.com/file/d/'+encodeURIComponent(result.id)+'/view';a.target='_blank';a.rel='noopener noreferrer';a.textContent='Open uploaded file in Google Drive';$('result').append(a);
+  const p=document.createElement('p');p.className='muted';p.textContent='File ID: '+result.id;$('result').append(p);
+  status('Upload successful. File saved to the authorized Google account’s My Drive.');
+ }catch(e){status('Upload error: '+errorMessage(e));}
+ finally{setBusy(false);controller=null;}
+}
+$('login').addEventListener('click',authorize);
+$('upload').addEventListener('click',upload);
+$('cancel').addEventListener('click',()=>controller?.abort());
+</script></body></html>
