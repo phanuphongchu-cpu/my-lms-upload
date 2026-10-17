@@ -11,7 +11,7 @@
 <body><main class="wrap">
 <h1>My LMS — File Upload</h1>
 <p class="muted">Google Drive resumable upload · PDF / DOCX / PPTX · สูงสุด 50 MB</p>
-<p class="muted">เจ้าของ LMS เท่านั้นในช่วงทดสอบ ไฟล์จะถูกสร้างใน My Drive ของบัญชีที่อนุญาต</p>
+<p class="muted">เจ้าของ LMS เท่านั้นในช่วงทดสอบ หลังอัปโหลดจะตั้งสิทธิ์ไฟล์เป็น Anyone with the link — Viewer</p>
 <label for="clientId">Google OAuth Client ID</label>
 <input id="clientId" placeholder="123...apps.googleusercontent.com" autocomplete="off">
 <label for="file">เลือกไฟล์</label>
@@ -20,7 +20,7 @@
 <p id="account" class="muted">ยังไม่ได้รับสิทธิ์ Google Drive</p>
 <progress id="progress" value="0" max="100"></progress><p id="percent" class="muted">0%</p>
 <p id="status" role="status"></p><div id="result"></div>
-<hr><p class="muted">หลังทดสอบสำเร็จ เราจะเชื่อมไฟล์กับ CourseResources ใน Apps Script โดยตรวจสอบสิทธิ์ฝั่ง Server ก่อนบันทึก</p>
+<hr><p class="muted">การแชร์ลิงก์เป็นสาธารณะสำหรับผู้มีลิงก์เท่านั้น ยังไม่ได้บันทึก CourseResources ใน LMS</p>
 </main>
 <script>
 'use strict';
@@ -77,6 +77,11 @@ async function sendChunk(session,file,start){
  if(!r.ok)throw new Error('Chunk upload failed ('+r.status+'): '+(await r.text()).slice(0,300));
  return {next:file.size,result:await r.json()};
 }
+async function makeLinkViewable(fileId){
+ const url='https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(fileId)+'/permissions?fields=id,type,role';
+ const r=await apiFetch(url,{method:'POST',headers:{Authorization:'Bearer '+accessToken,'Content-Type':'application/json'},body:JSON.stringify({type:'anyone',role:'reader'}),signal:controller.signal});
+ if(!r.ok)throw new Error('Sharing permission failed ('+r.status+'): '+(await r.text()).slice(0,400));
+}
 async function upload(){
  if(!accessToken){status('กรุณา Authorize ก่อน');return;}
  const file=$('file').files[0];if(!file){status('กรุณาเลือกไฟล์');return;}
@@ -102,9 +107,11 @@ async function upload(){
    status('Uploading '+offset.toLocaleString()+' / '+file.size.toLocaleString()+' bytes');
   }
   if(!result?.id)throw new Error('Upload finished, but no file ID was returned. Check Drive before retrying.');
+  status('Upload complete. Setting Anyone with the link — Viewer permission...');
+  try{await makeLinkViewable(result.id);}catch(e){throw new Error('File uploaded (ID: '+result.id+'), but could not enable link sharing. '+errorMessage(e));}
   const a=document.createElement('a');a.href=result.webViewLink||'https://drive.google.com/file/d/'+encodeURIComponent(result.id)+'/view';a.target='_blank';a.rel='noopener noreferrer';a.textContent='Open uploaded file in Google Drive';$('result').append(a);
   const p=document.createElement('p');p.className='muted';p.textContent='File ID: '+result.id;$('result').append(p);
-  status('Upload successful. File saved to the authorized Google account’s My Drive.');
+  status('Upload successful. Anyone with the link can view this file.');
  }catch(e){status('Upload error: '+errorMessage(e));}
  finally{setBusy(false);controller=null;}
 }
