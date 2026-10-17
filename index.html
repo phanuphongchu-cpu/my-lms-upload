@@ -10,28 +10,54 @@
 </head>
 <body><main class="wrap">
 <h1>My LMS — File Upload</h1>
-<p class="muted">Google Drive resumable upload · PDF / DOCX / PPTX · สูงสุด 50 MB</p>
+<p class="muted">Google Drive resumable upload · PDF / DOCX / PPTX · สูงสุด 60 MB</p>
 <p class="muted">เจ้าของ LMS เท่านั้นในช่วงทดสอบ หลังอัปโหลดจะตั้งสิทธิ์ไฟล์เป็น Anyone with the link — Viewer</p>
 <label for="clientId">Google OAuth Client ID</label>
 <input id="clientId" placeholder="123...apps.googleusercontent.com" autocomplete="off">
+<label for="courseId">Course ID (ต้องตรงกับชีต Courses)</label>
+<input id="courseId" placeholder="เช่น MATH-G10" required>
+<label for="category">Category</label>
+<select id="category"><option>Materials</option><option>Assignments</option><option>Lectures</option></select>
+<label for="title">Title</label><input id="title" placeholder="ชื่อเอกสาร" required maxlength="200">
 <label for="file">เลือกไฟล์</label>
 <input id="file" type="file" accept=".pdf,.docx,.pptx">
 <div class="row"><button id="login">Authorize Google Drive</button><button id="upload" disabled>Upload File</button><button id="cancel" disabled>Cancel</button></div>
 <p id="account" class="muted">ยังไม่ได้รับสิทธิ์ Google Drive</p>
 <progress id="progress" value="0" max="100"></progress><p id="percent" class="muted">0%</p>
 <p id="status" role="status"></p><div id="result"></div>
-<hr><p class="muted">การแชร์ลิงก์เป็นสาธารณะสำหรับผู้มีลิงก์เท่านั้น ยังไม่ได้บันทึก CourseResources ใน LMS</p>
+<hr><p class="muted">ครั้งแรกระบบจะสร้างโฟลเดอร์ My-LMS-Upload-Inbox ใน Drive ของคุณ โปรดคัดลอก Folder ID ไปตั้งค่าใน Apps Script ตามคู่มือ ระบบจะสร้างไฟล์คำสั่ง (ticket) ส่วนตัวเพื่อให้ Apps Script บันทึกลง Google Sheets ภายหลัง</p><p id="folderInfo" class="muted"></p>
 </main>
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
-const MAX=50*1024*1024, CHUNK=4*1024*1024;
+const MAX=60*1024*1024, CHUNK=4*1024*1024;
 const MIME={pdf:'application/pdf',docx:'application/vnd.openxmlformats-officedocument.wordprocessingml.document',pptx:'application/vnd.openxmlformats-officedocument.presentationml.presentation'};
 let accessToken='', tokenClient=null, controller=null, uploading=false;
+let inboxFolderId=localStorage.getItem('lmsUploadInboxFolderId')||'';
 const status=s=>$('status').textContent=s;
 function setBusy(b){uploading=b;$('upload').disabled=b||!accessToken;$('cancel').disabled=!b;$('login').disabled=b;$('file').disabled=b;}
 function errorMessage(e){return e instanceof Error?e.message:String(e);}
 function wait(ms){return new Promise(r=>setTimeout(r,ms));}
+async function ensureInboxFolder(){
+ if(inboxFolderId){
+   const check=await apiFetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(inboxFolderId)+'?fields=id,mimeType,trashed',{headers:{Authorization:'Bearer '+accessToken}});
+   if(check.ok){const x=await check.json();if(x.mimeType==='application/vnd.google-apps.folder'&&!x.trashed)return inboxFolderId;}
+   inboxFolderId='';localStorage.removeItem('lmsUploadInboxFolderId');
+ }
+ const r=await apiFetch('https://www.googleapis.com/drive/v3/files?fields=id,name',{method:'POST',headers:{Authorization:'Bearer '+accessToken,'Content-Type':'application/json'},body:JSON.stringify({name:'My-LMS-Upload-Inbox',mimeType:'application/vnd.google-apps.folder'})});
+ if(!r.ok)throw new Error('Cannot create inbox folder: '+r.status+' '+(await r.text()).slice(0,300));
+ inboxFolderId=(await r.json()).id;localStorage.setItem('lmsUploadInboxFolderId',inboxFolderId);
+ return inboxFolderId;
+}
+async function createTicket(fileId,courseId,category,title){
+ const ticket={fileId,courseId,category,title};
+ const body=JSON.stringify(ticket);
+ const metadata={name:'LMS-TICKET-'+crypto.randomUUID()+'.json',mimeType:'application/json',parents:[inboxFolderId]};
+ const boundary='lms_'+crypto.randomUUID().replace(/-/g,'');
+ const payload='--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+JSON.stringify(metadata)+'\r\n--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+body+'\r\n--'+boundary+'--';
+ const r=await apiFetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',{method:'POST',headers:{Authorization:'Bearer '+accessToken,'Content-Type':'multipart/related; boundary='+boundary},body:payload});
+ if(!r.ok)throw new Error('Metadata ticket failed ('+r.status+'): '+(await r.text()).slice(0,400));
+}
 function authorize(){
  const id=$('clientId').value.trim();
  if(!/^[\w-]+\.apps\.googleusercontent\.com$/.test(id)){status('กรุณากรอก OAuth Client ID ให้ถูกต้อง');return;}
@@ -55,7 +81,7 @@ async function apiFetch(url,options={},tries=3){
 }
 async function startSession(file,mime){
  // The browser makes the authenticated session request. The Drive response must expose Location via CORS.
- const metadata={name:file.name,mimeType:mime};
+ const metadata={name:file.name,mimeType:mime,parents:[inboxFolderId]};
  const url='https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,webViewLink,mimeType,size';
  const r=await apiFetch(url,{method:'POST',headers:{Authorization:'Bearer '+accessToken,'Content-Type':'application/json; charset=UTF-8','X-Upload-Content-Type':mime,'X-Upload-Content-Length':String(file.size)},body:JSON.stringify(metadata),signal:controller.signal});
  if(!r.ok)throw new Error('Cannot start upload ('+r.status+'): '+(await r.text()).slice(0,300));
@@ -85,10 +111,13 @@ async function makeLinkViewable(fileId){
 async function upload(){
  if(!accessToken){status('กรุณา Authorize ก่อน');return;}
  const file=$('file').files[0];if(!file){status('กรุณาเลือกไฟล์');return;}
+ const courseId=$('courseId').value.trim(),category=$('category').value,title=$('title').value.trim();
+ if(!courseId||!title){status('กรุณากรอก Course ID และ Title');return;}
  const ext=file.name.split('.').pop().toLowerCase(),mime=MIME[ext];
- if(!mime||file.size===0||file.size>MAX){status('รองรับ PDF, DOCX, PPTX ขนาด 1 byte ถึง 50 MB');return;}
+ if(!mime||file.size===0||file.size>MAX){status('รองรับ PDF, DOCX, PPTX ขนาด 1 byte ถึง 60 MB');return;}
  controller=new AbortController();setBusy(true);$('result').replaceChildren();$('progress').value=0;$('percent').textContent='0%';
  try{
+  status('กำลังเตรียมโฟลเดอร์...');await ensureInboxFolder();$('folderInfo').textContent='Upload Inbox Folder ID: '+inboxFolderId;
   status('กำลังเริ่มการอัปโหลด...');const session=await startSession(file,mime);
   let offset=0,attempts=0,result;
   while(offset<file.size){
@@ -109,9 +138,10 @@ async function upload(){
   if(!result?.id)throw new Error('Upload finished, but no file ID was returned. Check Drive before retrying.');
   status('Upload complete. Setting Anyone with the link — Viewer permission...');
   try{await makeLinkViewable(result.id);}catch(e){throw new Error('File uploaded (ID: '+result.id+'), but could not enable link sharing. '+errorMessage(e));}
+  status('กำลังส่งข้อมูลรายวิชาไปยัง Inbox...');await createTicket(result.id,courseId,category,title);
   const a=document.createElement('a');a.href=result.webViewLink||'https://drive.google.com/file/d/'+encodeURIComponent(result.id)+'/view';a.target='_blank';a.rel='noopener noreferrer';a.textContent='Open uploaded file in Google Drive';$('result').append(a);
   const p=document.createElement('p');p.className='muted';p.textContent='File ID: '+result.id;$('result').append(p);
-  status('Upload successful. Anyone with the link can view this file.');
+  status('Upload and sharing successful. Metadata ticket created. Apps Script will sync CourseResources within approximately 5 minutes after setup.');
  }catch(e){status('Upload error: '+errorMessage(e));}
  finally{setBusy(false);controller=null;}
 }
