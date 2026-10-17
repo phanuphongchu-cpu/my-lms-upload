@@ -145,6 +145,18 @@ async function upload(){
  }catch(e){status('Upload error: '+errorMessage(e));}
  finally{setBusy(false);controller=null;}
 }
+// Stage 5.7.3: prefill course metadata passed from My LMS Add Content.
+// URL parameters are only form defaults; existing upload validation still applies.
+function prefillFromLms() {
+  const params = new URLSearchParams(window.location.search);
+  const courseId = (params.get('courseId') || '').trim();
+  const category = (params.get('category') || '').trim();
+  const title = (params.get('title') || '').trim();
+  if (courseId && courseId.length <= 30) $('courseId').value = courseId;
+  if (['Materials', 'Assignments', 'Lectures'].includes(category)) $('category').value = category;
+  if (title) $('title').value = title.slice(0, 200);
+}
+prefillFromLms();
 $('login').addEventListener('click',authorize);
 $('upload').addEventListener('click',upload);
 $('cancel').addEventListener('click',()=>controller?.abort());
